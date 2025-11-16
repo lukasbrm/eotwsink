@@ -3,6 +3,7 @@ use std::fs;
 use axum::{Json, Router, extract::Request, http::StatusCode, response::IntoResponse, routing::{get, post}};
 use axum_extra::extract::Multipart;
 use serde_json::json;
+use zip::{ZipWriter, unstable::LittleEndianWriteExt, write::FileOptions};
 
 enum ApiError {
     NotFound,
@@ -31,6 +32,63 @@ async fn health_check() -> impl IntoResponse {
         "status": "ok",
         "message": "Server is running :)"
     }))
+}
+
+async fn download_log() -> Result<impl IntoResponse, ApiError> {
+    use std::io::Write;
+    use axum::response::Response;
+    use axum::body::Body;
+    use axum::http::header;
+    
+    let data_dir = "/opt/eotw_data";
+    
+    if !std::path::Path::new(data_dir).exists() {
+        return Err(ApiError::NotFound);
+    }
+    let mut zip_buffer = Vec::new();
+    {
+        let mut zip = ZipWriter::new(std::io::Cursor::new(&mut zip_buffer));
+        let options = FileOptions::<()>::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(0o755);
+        
+        for entry in walkdir::WalkDir::new(data_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+        {
+            let path = entry.path();
+            let name = path.strip_prefix(data_dir)
+                .map_err(|e| ApiError::InternalError(format!("Path error: {}", e)))?;
+            
+            let file_data = fs::read(path)
+                .map_err(|e| ApiError::InternalError(format!("Failed to read file: {}", e)))?;
+            
+            zip.start_file(name.to_string_lossy().to_string(), options)
+                .map_err(|e| ApiError::InternalError(format!("Failed to add file to zip: {}", e)))?;
+            
+            zip.write(&file_data)
+                .map_err(|e| ApiError::InternalError(format!("Failed to write to zip: {}", e)))?;
+        }
+        
+        zip.finish()
+            .map_err(|e| ApiError::InternalError(format!("Failed to finalize zip: {}", e)))?;
+    }
+    
+    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+    let filename = format!("logs_{}.zip", timestamp);
+    
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/zip")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}\"", filename)
+        )
+        .body(Body::from(zip_buffer))
+        .map_err(|e| ApiError::InternalError(format!("Failed to build response: {}", e)))?;
+    
+    Ok(response)
 }
 
 async fn upload_log(mut multipart: Multipart) -> Result<impl IntoResponse, ApiError> {
@@ -85,6 +143,7 @@ fn create_app() -> Router {
     Router::new()
         .route("/health", get(health_check))
         .route("/upload", post(upload_log))
+        .route("/download", get(download_log))
 }
 
 #[tokio::main]
