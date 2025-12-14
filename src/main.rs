@@ -139,11 +139,63 @@ async fn upload_log(mut multipart: Multipart) -> Result<impl IntoResponse, ApiEr
     })))
 }
 
+async fn next_model() -> Result<impl IntoResponse, ApiError> {
+    use std::collections::HashMap;
+    
+    let data_dir = "/opt/eotw_data";
+    
+    if !std::path::Path::new(data_dir).exists() {
+        return Err(ApiError::NotFound);
+    }
+    
+    let mut model_counts: HashMap<String, usize> = HashMap::new();
+    
+    for entry in walkdir::WalkDir::new(data_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        let path = entry.path();
+        
+        if let Ok(content) = fs::read_to_string(path) {
+            for line in content.lines().skip(1) { // Skip header
+                let fields: Vec<&str> = line.split('\t').collect();
+                
+                if fields.len() >= 4 {
+                    let role = fields[0].trim();
+                    let name = fields[2].trim();
+                    let message = fields[3].trim();
+                    
+                    if role == "System" && name == "Languagemodel" {
+                        *model_counts.entry(message.to_string()).or_insert(0) += 1;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    
+    if model_counts.is_empty() {
+        return Err(ApiError::NotFound);
+    }
+    
+    let next_model = model_counts.iter()
+        .min_by_key(|(_, count)| *count)
+        .map(|(model, _)| model.clone())
+        .ok_or_else(|| ApiError::InternalError("Failed to determine next model".to_string()))?;
+    
+    Ok(Json(json!({
+        "next_model": next_model,
+        "counts": model_counts
+    })))
+}
+
 fn create_app() -> Router {
     Router::new()
         .route("/health", get(health_check))
         .route("/upload", post(upload_log))
         .route("/download", get(download_log))
+        .route("/nextmodel", get(next_model))
 }
 
 #[tokio::main]
